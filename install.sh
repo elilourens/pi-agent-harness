@@ -1,72 +1,35 @@
 #!/usr/bin/env bash
+# Pi agent harness setup. Use --with-boot for a systemd auto-start service.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PI_DIR="${HOME}/.pi"
-AGENT_DIR="${PI_DIR}/agent"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PI_DIR="$HOME/.pi"
+AGENT="$PI_DIR/agent"
 
-echo "=== Pi Agent Harness Setup ==="
-echo ""
-
-# ── Check Pi is installed ─────────────────────────────────────────────
-if ! command -v pi &>/dev/null; then
-  echo "Pi not found. Installing..."
-  npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-  echo ""
-fi
+command -v pi &>/dev/null || npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 echo "Pi version: $(pi --version)"
-echo ""
 
-# ── Copy config files ─────────────────────────────────────────────────
-mkdir -p "${AGENT_DIR}/extensions"
+mkdir -p "$AGENT/extensions"
+cp "$DIR/config/settings.json" "$AGENT/settings.json"
+cp "$DIR/config/extensions/model-router.ts" "$AGENT/extensions/model-router.ts"
+echo "✓ config installed"
 
-cp "${SCRIPT_DIR}/config/settings.json" "${AGENT_DIR}/settings.json"
-echo "✓ settings.json"
-
-cp "${SCRIPT_DIR}/config/extensions/model-router.ts" "${AGENT_DIR}/extensions/model-router.ts"
-echo "✓ model-router.ts"
-
-# ── API key ───────────────────────────────────────────────────────────
-if [ -f "${AGENT_DIR}/auth.json" ]; then
-  echo "✓ auth.json already exists (keeping existing key)"
-elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  cat > "${AGENT_DIR}/auth.json" << AUTHEOF
-{
-  "anthropic": {
-    "apiKey": "${ANTHROPIC_API_KEY}"
-  }
-}
-AUTHEOF
-  chmod 600 "${AGENT_DIR}/auth.json"
-  echo "✓ auth.json (from ANTHROPIC_API_KEY env var)"
-else
-  echo ""
-  echo "No API key found. Enter your Anthropic API key (sk-ant-...):"
-  read -r -s API_KEY
-  cat > "${AGENT_DIR}/auth.json" << AUTHEOF
-{
-  "anthropic": {
-    "apiKey": "${API_KEY}"
-  }
-}
-AUTHEOF
-  chmod 600 "${AGENT_DIR}/auth.json"
-  echo "✓ auth.json"
+# API key → auth.json (keep existing; else env var; else prompt)
+if [ ! -f "$AGENT/auth.json" ]; then
+  KEY="${ANTHROPIC_API_KEY:-}"
+  if [ -z "$KEY" ]; then
+    echo "Enter your Anthropic API key (sk-ant-...):"
+    read -r -s KEY
+  fi
+  printf '{\n  "anthropic": { "apiKey": "%s" }\n}\n' "$KEY" > "$AGENT/auth.json"
+  chmod 600 "$AGENT/auth.json"
 fi
+echo "✓ auth.json"
 
-# ── Boot service (optional) ───────────────────────────────────────────
 if [ "${1:-}" = "--with-boot" ]; then
-  echo ""
-  echo "Setting up auto-start on boot..."
-
-  cp "${SCRIPT_DIR}/boot/start-pi.sh" "${PI_DIR}/start-pi.sh"
-  chmod +x "${PI_DIR}/start-pi.sh"
-
-  # Adjust paths for current user
-  CURRENT_USER="$(whoami)"
-  CURRENT_HOME="${HOME}"
-
-  sudo tee /etc/systemd/system/pi-agent.service > /dev/null << SVCEOF
+  cp "$DIR/boot/start-pi.sh" "$PI_DIR/start-pi.sh"
+  chmod +x "$PI_DIR/start-pi.sh"
+  sudo tee /etc/systemd/system/pi-agent.service > /dev/null << EOF
 [Unit]
 Description=Pi Coding Agent (tmux session)
 After=network-online.target
@@ -75,25 +38,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-User=${CURRENT_USER}
-Environment=HOME=${CURRENT_HOME}
+User=$(whoami)
+Environment=HOME=$HOME
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=${PI_DIR}/start-pi.sh
+ExecStart=$PI_DIR/start-pi.sh
 ExecStop=/usr/bin/tmux kill-session -t pi-agent
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
-
+EOF
   sudo systemctl daemon-reload
   sudo systemctl enable pi-agent.service
-  echo "✓ systemd service enabled"
-  echo "  Start now with: sudo systemctl start pi-agent"
-  echo "  Attach with:    tmux attach -t pi-agent"
+  echo "✓ systemd service enabled (start: sudo systemctl start pi-agent)"
 fi
 
-echo ""
-echo "=== Done ==="
-echo ""
-echo "Run 'pi' to start, or use the boot service."
-echo "Commands: /plan /code /search /opus /router-status"
+echo "Done. Run 'pi' to start. Commands: /plan /code /search /opus /router-status"
