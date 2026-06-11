@@ -16,6 +16,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const PROVIDER = "anthropic";
+
 const MODELS = {
   planner:    "claude-fable-5",
   coder:      "claude-sonnet-4-6",
@@ -69,12 +71,27 @@ function modelFor(mode: Mode): string {
 export default function (pi: ExtensionAPI) {
   let currentMode: Mode = "planning";
 
-  function switchTo(mode: Mode, ctx?: any) {
-    if (mode === currentMode) return;
+  // Reconcile against the LIVE model (ctx.model), not the internal currentMode var.
+  // This avoids desync when the model is changed outside the router (/model, Ctrl+P,
+  // session defaults). setModel needs a Model object from the registry — passing a
+  // string is a silent no-op.
+  async function switchTo(mode: Mode, ctx?: any) {
+    const modelId = modelFor(mode);
+    // Keep the badge + mode label in sync with intent, always.
     currentMode = mode;
+    if (ctx?.ui) ctx.ui.setStatus("router", labelFor(mode));
+
+    // Already on the right model? Nothing to do.
+    if (ctx?.model?.id === modelId) return;
+
+    const model = ctx?.modelRegistry?.find(PROVIDER, modelId);
+    if (!model) {
+      ctx?.ui?.notify(`[router] model not found: ${PROVIDER}/${modelId}`, "error");
+      return;
+    }
     try {
-      pi.setModel(modelFor(mode));
-      if (ctx?.ui) ctx.ui.setStatus("router", labelFor(mode));
+      const ok = await pi.setModel(model);
+      if (!ok) ctx?.ui?.notify(`[router] no API key for ${modelId}`, "error");
     } catch (err) {
       console.warn(`[router] switch to ${mode} failed:`, err);
     }
@@ -85,9 +102,9 @@ export default function (pi: ExtensionAPI) {
     const name = event.toolName ?? "";
 
     if (CODE_TOOLS.has(name)) {
-      switchTo("coding", ctx);
+      await switchTo("coding", ctx);
     } else if (SEARCH_TOOLS.has(name)) {
-      switchTo("search", ctx);
+      await switchTo("search", ctx);
     }
     // NEUTRAL_TOOLS: do nothing, stay on current model
   });
@@ -96,7 +113,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", async (event, ctx) => {
     const name = event.toolName ?? "";
     if (SEARCH_TOOLS.has(name)) {
-      switchTo("planning", ctx);
+      await switchTo("planning", ctx);
     }
   });
 
@@ -104,14 +121,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     // Each new user message starts fresh on the planner.
     // If the LLM needs to code, tool_call will swap it.
-    switchTo("planning", ctx);
+    await switchTo("planning", ctx);
   });
 
   // ── Manual overrides ───────────────────────────────────────────────
   pi.registerCommand("plan", {
     description: "Switch to Fable 5 (planning)",
     handler: async (_args, ctx) => {
-      switchTo("planning", ctx);
+      await switchTo("planning", ctx);
       ctx.ui.notify("→ Fable 5 (planning)", "info");
     },
   });
@@ -119,7 +136,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("code", {
     description: "Switch to Sonnet 4.6 (coding)",
     handler: async (_args, ctx) => {
-      switchTo("coding", ctx);
+      await switchTo("coding", ctx);
       ctx.ui.notify("→ Sonnet 4.6 (coding)", "info");
     },
   });
@@ -127,7 +144,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("search", {
     description: "Switch to Haiku 4.5 (search)",
     handler: async (_args, ctx) => {
-      switchTo("search", ctx);
+      await switchTo("search", ctx);
       ctx.ui.notify("→ Haiku 4.5 (search)", "info");
     },
   });
@@ -135,7 +152,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("opus", {
     description: "Switch to Opus 4.8 (heavy reasoning)",
     handler: async (_args, ctx) => {
-      switchTo("heavy", ctx);
+      await switchTo("heavy", ctx);
       ctx.ui.notify("→ Opus 4.8 (heavy reasoning)", "info");
     },
   });
@@ -161,6 +178,6 @@ export default function (pi: ExtensionAPI) {
 
   // ── Startup ────────────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("router", labelFor("planning"));
+    await switchTo("planning", ctx);
   });
 }
