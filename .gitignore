@@ -1,0 +1,10 @@
+# Don't commit secrets
+config/auth.json
+*.jsonl
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
