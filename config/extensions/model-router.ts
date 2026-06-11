@@ -13,6 +13,8 @@
 //   4. tool_result         → search done → back to Fable for analysis
 //
 // Context pressure: badge turns amber at 70%, red at 85% — high context = expensive turns.
+// Planner diet: tool results are truncated in Fable's context view only (deterministic,
+// so Fable's own cache prefix stays stable; Sonnet/Haiku see full context).
 // Live cost badge + /cost breakdown; /router-status for routing stats.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -31,6 +33,10 @@ const MODE = {
 const CODE_TOOLS   = new Set(["write_file", "edit_file", "create_file", "apply_patch", "bash"]);
 const SEARCH_TOOLS = new Set(["web_search", "browser", "fetch", "curl"]);
 // read_file/grep are ambiguous — never switch on them.
+
+// Max chars of any tool result shown to the planner. Truncation is per-message and
+// deterministic (same message always truncates identically), keeping cache prefixes stable.
+const PLANNER_TOOLRESULT_MAX = 1500;
 
 // ── Prompt classifier ─────────────────────────────────────────────────────────
 // Runs in before_agent_start (which has event.prompt) so the result is ready
@@ -128,6 +134,24 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     pendingMode = enabled ? classifyPrompt(event.prompt) : null;
     setCtxBadge(ctx);
+  });
+
+  // Planner diet: shrink tool results in Fable's context view only.
+  // The planner needs to know WHAT happened, not every line of bash/file output.
+  pi.on("context", async (event, ctx) => {
+    if (!enabled || ctx?.model?.id !== MODE.planning.model) return;
+    let changed = false;
+    for (const m of event.messages as any[]) {
+      if (m.role !== "toolResult" || !Array.isArray(m.content)) continue;
+      for (const part of m.content) {
+        if (part.type === "text" && part.text?.length > PLANNER_TOOLRESULT_MAX) {
+          part.text = part.text.slice(0, PLANNER_TOOLRESULT_MAX) +
+            `\n…[truncated for planner — full output was ${part.text.length} chars]`;
+          changed = true;
+        }
+      }
+    }
+    if (changed) return { messages: event.messages };
   });
 
   // Sync with external model changes (/model, Ctrl+P).
@@ -270,6 +294,7 @@ export default function (pi: ExtensionAPI) {
           "  obvious code-edit prompt              → Sonnet 4.6  [skips planning]",
           "  everything else                       → Fable 5     [planning turn]",
           "  write_file/edit_file/bash tool        → Sonnet 4.6",
+          `  planner context                       → tool results capped at ${PLANNER_TOOLRESULT_MAX} chars`,
           "  web_search/browser/fetch tool         → Haiku 4.5   [returns to Fable after]",
           "  parallel tools                        → higher priority wins",
           "",
