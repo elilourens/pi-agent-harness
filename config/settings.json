@@ -1,6 +1,6 @@
 {
   "defaultProvider": "anthropic",
-  "defaultModel": "claude-opus-4-8",
+  "defaultModel": "claude-fable-5",
   "defaultThinkingLevel": "medium",
   "theme": "dark",
   "quietStartup": false,
