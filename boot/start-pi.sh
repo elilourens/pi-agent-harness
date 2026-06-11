@@ -10,5 +10,6 @@ source "$HOME/.profile" 2>/dev/null || true
 tmux has-session -t "$SESSION" 2>/dev/null && { echo "Session '$SESSION' already running"; exit 0; }
 
 unset TMUX
-tmux new-session -d -s "$SESSION" -c "$HOME" "$(command -v pi || echo /usr/bin/pi)"
+# Long cache retention: extends Anthropic prompt cache TTL from 5 min → 1 hour.
+tmux new-session -d -s "$SESSION" -c "$HOME" -e "PI_CACHE_RETENTION=long" "$(command -v pi || echo /usr/bin/pi)"
 echo "Pi started in tmux session '$SESSION' — attach: tmux attach -t $SESSION"

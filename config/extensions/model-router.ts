@@ -160,6 +160,11 @@ export default function (pi: ExtensionAPI) {
       const total = totalCost();
       if (total === 0) return ctx.ui.notify("No costs recorded yet.", "info");
 
+      // Cache reads cost 0.1× input price → savings vs paying full input = cacheRead × 9.
+      const allCosts = [...costs.values()];
+      const saved = allCosts.reduce((s, c) => s + c.cacheRead * 9, 0);
+      const wouldHavePaid = total + saved;
+
       const rows = [...costs.entries()]
         .sort((a, b) => b[1].total - a[1].total)
         .map(([id, c]) => [
@@ -167,11 +172,19 @@ export default function (pi: ExtensionAPI) {
           `total ${fmt(c.total).padStart(9)}`,
           `in ${fmt(c.input).padStart(9)}`,
           `out ${fmt(c.output).padStart(9)}`,
-          `cache ${fmt(c.cacheRead + c.cacheWrite).padStart(9)}`,
+          `cache↓ ${fmt(c.cacheRead).padStart(8)}`,   // read (cheap)
+          `cache↑ ${fmt(c.cacheWrite).padStart(8)}`,  // write (1.25×)
         ].join("  "));
 
       ctx.ui.notify(
-        [`Session total: ${fmt(total)}`, "", "By model:", ...rows].join("\n"),
+        [
+          `Session total:  ${fmt(total)}`,
+          `Without cache:  ${fmt(wouldHavePaid)}`,
+          `Cache savings:  ${fmt(saved)}  (${saved > 0 ? Math.round((saved / wouldHavePaid) * 100) : 0}% off)`,
+          "",
+          "By model (cache↓ = reads @ 0.1× | cache↑ = writes @ 1.25×):",
+          ...rows,
+        ].join("\n"),
         "info",
       );
     },
