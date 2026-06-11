@@ -9,9 +9,16 @@
  *   Haiku 4.5  → web search, fetch, browsing
  *   Opus 4.8   → manual only (/opus), heavy reasoning
  *
+ * Thinking level is co-routed with the model (search runs low, heavy runs high).
  * After search tools finish, returns to Fable 5 for analysis.
  * After code tools finish, stays on Sonnet (coding is usually multi-step).
- * /plan resets back to Fable 5 when you're done coding.
+ * Within a single agent run, parallel tool calls can't downgrade the mode
+ * (code beats search). /plan resets back to Fable 5 when you're done coding.
+ *
+ * Commands:
+ *   /plan /code /search /opus  — manual mode overrides
+ *   /router-pause /router-resume — toggle auto-routing (manual commands still work)
+ *   /router-status             — intent vs live model, request stats per model
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -49,6 +56,26 @@ const NEUTRAL_TOOLS = new Set([
 ]);
 
 type Mode = "planning" | "coding" | "search" | "heavy";
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+// Within one agent run, a tool call may only switch to a mode of >= priority.
+// Prevents parallel tool calls racing (e.g. bash + web_search in one turn)
+// from non-deterministically downgrading coding → search.
+const MODE_PRIORITY: Record<Mode, number> = {
+  planning: 0,
+  search:   1,
+  coding:   2,
+  heavy:    3,
+};
+
+// Thinking level co-routed with the model: planning/coding benefit from medium,
+// search wants speed, heavy reasoning gets the full budget.
+const MODE_THINKING: Record<Mode, ThinkingLevel> = {
+  planning: "medium",
+  coding:   "medium",
+  search:   "low",
+  heavy:    "high",
+};
 
 function labelFor(mode: Mode): string {
   switch (mode) {
@@ -68,43 +95,112 @@ function modelFor(mode: Mode): string {
   }
 }
 
+function modeForModelId(modelId: string): Mode | undefined {
+  switch (modelId) {
+    case MODELS.planner: return "planning";
+    case MODELS.coder:   return "coding";
+    case MODELS.search:  return "search";
+    case MODELS.heavy:   return "heavy";
+    default:             return undefined;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   let currentMode: Mode = "planning";
+  let routingEnabled = true;
+  // Minimum priority a tool-triggered switch must meet within the current agent run.
+  let turnFloor = 0;
+  // Per-session request counts, keyed by live model id (counted at turn_start).
+  const requestsByModel = new Map<string, number>();
+
+  function setBadge(ctx: any, text: string) {
+    if (ctx?.ui) ctx.ui.setStatus("router", text);
+  }
+
+  function badgeText(mode: Mode): string {
+    return routingEnabled ? labelFor(mode) : `⏸ ${labelFor(mode)}`;
+  }
 
   // Reconcile against the LIVE model (ctx.model), not the internal currentMode var.
-  // This avoids desync when the model is changed outside the router (/model, Ctrl+P,
-  // session defaults). setModel needs a Model object from the registry — passing a
-  // string is a silent no-op.
-  async function switchTo(mode: Mode, ctx?: any) {
+  // Mode/badge are only committed AFTER the model switch is confirmed, so the badge
+  // can never claim a model that isn't actually active.
+  // setModel needs a Model object from the registry — a bare string is a silent no-op.
+  async function switchTo(mode: Mode, ctx?: any): Promise<boolean> {
     const modelId = modelFor(mode);
-    // Keep the badge + mode label in sync with intent, always.
-    currentMode = mode;
-    if (ctx?.ui) ctx.ui.setStatus("router", labelFor(mode));
 
-    // Already on the right model? Nothing to do.
-    if (ctx?.model?.id === modelId) return;
+    // Already on the right model? Commit the mode label and re-align thinking.
+    if (ctx?.model?.id === modelId) {
+      currentMode = mode;
+      setBadge(ctx, badgeText(mode));
+      try { pi.setThinkingLevel(MODE_THINKING[mode]); } catch {}
+      return true;
+    }
 
     const model = ctx?.modelRegistry?.find(PROVIDER, modelId);
     if (!model) {
       ctx?.ui?.notify(`[router] model not found: ${PROVIDER}/${modelId}`, "error");
-      return;
+      return false;
     }
     try {
       const ok = await pi.setModel(model);
-      if (!ok) ctx?.ui?.notify(`[router] no API key for ${modelId}`, "error");
+      if (!ok) {
+        ctx?.ui?.notify(`[router] no API key for ${modelId}`, "error");
+        return false;
+      }
+      // Switch confirmed — now commit mode, badge, and thinking level.
+      currentMode = mode;
+      setBadge(ctx, badgeText(mode));
+      try { pi.setThinkingLevel(MODE_THINKING[mode]); } catch {}
+      return true;
     } catch (err) {
       console.warn(`[router] switch to ${mode} failed:`, err);
+      return false;
     }
   }
+
+  // Tool-triggered switches respect the per-run priority floor.
+  async function autoSwitchTo(mode: Mode, ctx?: any) {
+    if (!routingEnabled) return;
+    if (MODE_PRIORITY[mode] < turnFloor) return;
+    if (await switchTo(mode, ctx)) {
+      turnFloor = MODE_PRIORITY[mode];
+    }
+  }
+
+  // Manual switches bypass the floor and set it.
+  async function manualSwitchTo(mode: Mode, ctx: any, message: string) {
+    if (await switchTo(mode, ctx)) {
+      turnFloor = MODE_PRIORITY[mode];
+      ctx.ui.notify(message, "info");
+    }
+  }
+
+  // ── Keep state in sync with external model changes (/model, Ctrl+P) ──
+  pi.on("model_select", async (event, ctx) => {
+    const mode = modeForModelId(event.model?.id ?? "");
+    if (mode) {
+      currentMode = mode;
+      setBadge(ctx, badgeText(mode));
+    } else {
+      // Model outside the routing table — show it honestly rather than lying.
+      setBadge(ctx, `Manual (${event.model?.id ?? "unknown"})`);
+    }
+  });
+
+  // ── Per-model request stats (one turn = one LLM request) ───────────
+  pi.on("turn_start", async (_event, ctx) => {
+    const id = ctx?.model?.id;
+    if (id) requestsByModel.set(id, (requestsByModel.get(id) ?? 0) + 1);
+  });
 
   // ── Tool starts → switch to the appropriate model ──────────────────
   pi.on("tool_call", async (event, ctx) => {
     const name = event.toolName ?? "";
 
     if (CODE_TOOLS.has(name)) {
-      await switchTo("coding", ctx);
+      await autoSwitchTo("coding", ctx);
     } else if (SEARCH_TOOLS.has(name)) {
-      await switchTo("search", ctx);
+      await autoSwitchTo("search", ctx);
     }
     // NEUTRAL_TOOLS: do nothing, stay on current model
   });
@@ -112,13 +208,18 @@ export default function (pi: ExtensionAPI) {
   // ── Search done → return to planner for analysis ───────────────────
   pi.on("tool_result", async (event, ctx) => {
     const name = event.toolName ?? "";
-    if (SEARCH_TOOLS.has(name)) {
+    // Only step down if search actually "won" this run — if coding took
+    // priority in parallel, stay on the coder.
+    if (SEARCH_TOOLS.has(name) && currentMode === "search" && routingEnabled) {
+      turnFloor = 0;
       await switchTo("planning", ctx);
     }
   });
 
-  // ── New agent turn with no prior mode → reset to planner ───────────
+  // ── New agent run → reset floor, start on the planner ──────────────
   pi.on("agent_start", async (_event, ctx) => {
+    turnFloor = 0;
+    if (!routingEnabled) return;
     // Each new user message starts fresh on the planner.
     // If the LLM needs to code, tool_call will swap it.
     await switchTo("planning", ctx);
@@ -128,48 +229,80 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("plan", {
     description: "Switch to Fable 5 (planning)",
     handler: async (_args, ctx) => {
-      await switchTo("planning", ctx);
-      ctx.ui.notify("→ Fable 5 (planning)", "info");
+      await manualSwitchTo("planning", ctx, "→ Fable 5 (planning)");
     },
   });
 
   pi.registerCommand("code", {
     description: "Switch to Sonnet 4.6 (coding)",
     handler: async (_args, ctx) => {
-      await switchTo("coding", ctx);
-      ctx.ui.notify("→ Sonnet 4.6 (coding)", "info");
+      await manualSwitchTo("coding", ctx, "→ Sonnet 4.6 (coding)");
     },
   });
 
   pi.registerCommand("search", {
     description: "Switch to Haiku 4.5 (search)",
     handler: async (_args, ctx) => {
-      await switchTo("search", ctx);
-      ctx.ui.notify("→ Haiku 4.5 (search)", "info");
+      await manualSwitchTo("search", ctx, "→ Haiku 4.5 (search)");
     },
   });
 
   pi.registerCommand("opus", {
     description: "Switch to Opus 4.8 (heavy reasoning)",
     handler: async (_args, ctx) => {
-      await switchTo("heavy", ctx);
-      ctx.ui.notify("→ Opus 4.8 (heavy reasoning)", "info");
+      await manualSwitchTo("heavy", ctx, "→ Opus 4.8 (heavy reasoning)");
+    },
+  });
+
+  // ── Pause / resume auto-routing ────────────────────────────────────
+  pi.registerCommand("router-pause", {
+    description: "Pause auto-routing (stay on current model; manual commands still work)",
+    handler: async (_args, ctx) => {
+      routingEnabled = false;
+      setBadge(ctx, badgeText(currentMode));
+      ctx.ui.notify("Router paused — staying on current model. /router-resume to re-enable.", "info");
+    },
+  });
+
+  pi.registerCommand("router-resume", {
+    description: "Resume auto-routing",
+    handler: async (_args, ctx) => {
+      routingEnabled = true;
+      setBadge(ctx, badgeText(currentMode));
+      ctx.ui.notify("Router resumed — auto-routing active.", "info");
     },
   });
 
   pi.registerCommand("router-status", {
     description: "Show current routing state",
     handler: async (_args, ctx) => {
+      const liveId = ctx?.model?.id ?? "unknown";
+      const intendedId = modelFor(currentMode);
+      const drift = liveId !== intendedId ? `  ⚠ DRIFT — router intends ${intendedId}` : "";
+
+      const total = [...requestsByModel.values()].reduce((a, b) => a + b, 0);
+      const statsLines =
+        total === 0
+          ? ["  (no requests yet)"]
+          : [...requestsByModel.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([id, n]) => `  ${id.padEnd(22)} ${String(n).padStart(4)}  (${Math.round((n / total) * 100)}%)`);
+
       ctx.ui.notify(
         [
-          `Current: ${currentMode} → ${modelFor(currentMode)}`,
+          `Live model: ${liveId}${drift}`,
+          `Router mode: ${currentMode} (${routingEnabled ? "auto-routing ON" : "PAUSED"})`,
+          ``,
+          `Requests this session:`,
+          ...statsLines,
           ``,
           `Auto-routing:`,
           `  write_file/edit_file/bash → Sonnet 4.6`,
           `  web_search/browser/fetch  → Haiku 4.5 (returns to Fable after)`,
           `  new message               → Fable 5 (planner)`,
+          `  parallel tools            → higher priority wins (code > search)`,
           ``,
-          `Manual: /plan /code /search /opus`,
+          `Manual: /plan /code /search /opus  •  /router-pause /router-resume`,
         ].join("\n"),
         "info"
       );
