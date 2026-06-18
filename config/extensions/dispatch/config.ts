@@ -23,8 +23,11 @@ export interface DispatchConfig {
   maxFanout: number;
   maxDescendants: number;
   maxTurns: number;
+  plannerMaxTurns: number;
   wallClockMs: number;
   allowedTools: string[];
+  plannerTools: string[];
+  implementerTools: string[];
   judgeAllowedTools: string[];
   runDirName: string;
   rubricWeights: Record<string, number>;
@@ -51,13 +54,26 @@ export const CONFIG: DispatchConfig = {
 
   // Per-implementer budget.
   maxTurns: 40,
+  // Per-planner budget (planning is read-only research, so it needs fewer turns).
+  plannerMaxTurns: 25,
   wallClockMs: 1_200_000, // 20 min
 
-  // Tools granted to implementers ("Agent" enables native subagents / persona inheritance).
+  // Tools granted to build-mode implementers ("Agent" enables native subagents /
+  // persona inheritance). Used by /dispatch-build + /dispatch-synthesize.
   allowedTools: ["Read", "Edit", "Write", "Bash", "Grep", "Glob", "Agent"],
 
-  // Judge gets read + verify ability (Bash to run tests) + Write (to emit verdict.json).
-  judgeAllowedTools: ["Read", "Bash", "Grep", "Glob", "Write"],
+  // Planner tools are INTENTIONALLY read-only — NO Edit/Write/Bash — so a planning
+  // agent physically cannot modify, create, or run anything in the repo. Plans are
+  // research only; the plan is the planner's final assistant message.
+  plannerTools: ["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
+
+  // Phase-2 implementer (the picked plan, applied directly on the working tree).
+  implementerTools: ["Read", "Edit", "Write", "Bash", "Grep", "Glob"],
+
+  // Judge is READ-ONLY for the codebase: it reads the repo (--add-dir) and the
+  // inlined plans, and runs Bash to verify claims/paths (and to write verdict.json
+  // into its own cwd). No Edit/Write — it cannot mutate the repo.
+  judgeAllowedTools: ["Read", "Grep", "Glob", "Bash"],
 
   runDirName: ".pi-dispatch",
 

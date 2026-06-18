@@ -17,8 +17,14 @@ import { basename, dirname, join } from "node:path";
 import { CONFIG } from "./config.ts";
 import { buildSubagentDefs, depthEnv } from "./caps.ts";
 import { readResult } from "./result.ts";
-import { spawnClaudeAgent } from "./spawn.ts";
-import { runJudge, type CollectedAgent, type VerdictJson } from "./judge.ts";
+import { spawnClaudeAgent, type SpawnUsage } from "./spawn.ts";
+import {
+  runJudge,
+  runPlanJudge,
+  type CollectedAgent,
+  type PlanAgent,
+  type VerdictJson,
+} from "./judge.ts";
 import {
   assertCleanRepo,
   commitWorktree,
@@ -49,6 +55,33 @@ export interface RunRecord {
   agents: CollectedAgent[];
   judge: { verdictMarkdown: string; verdictJson: VerdictJson | null };
   totals: { cost: number; turns: number };
+}
+
+// ── PLAN MODE (the default) ──────────────────────────────────────────────────
+
+export interface PlanRunRecord {
+  runId: string;
+  runDir: string;
+  task: string;
+  agents: PlanAgent[];
+  judge: { verdictMarkdown: string; verdictJson: VerdictJson | null };
+  totals: { cost: number; turns: number };
+}
+
+export interface ImplementOpts {
+  repoRoot: string;
+  personasDir: string;
+  agentId: string;
+  plan: string;
+  task: string;
+  onEvent?: (e: DispatchEvent) => void;
+}
+
+export interface ImplementResult {
+  exitCode: number | null;
+  timedOut: boolean;
+  resultText: string;
+  usage: SpawnUsage;
 }
 
 const log = (onEvent: DispatchOpts["onEvent"], e: DispatchEvent) => {
@@ -260,6 +293,216 @@ export async function dispatch(opts: DispatchOpts): Promise<RunRecord> {
   log(onEvent, { phase: "done", message: `Done. Total $${totals.cost.toFixed(4)}, ${totals.turns} turns.` });
 
   return record;
+}
+
+// Phase 1 — PLAN. Three personas RESEARCH and PROPOSE a plan (read-only, directly
+// in the repo — no worktrees, no branches, no clean-repo requirement). Then a judge
+// compares the plans and recommends one. Failure-tolerant: a crashed/empty planner
+// is recorded as failed and the batch continues.
+export async function dispatchPlan(opts: DispatchOpts): Promise<PlanRunRecord> {
+  const { task, repoRoot, personasDir, onEvent } = opts;
+
+  const runId = new Date().toISOString().replace(/[:.]/g, "-");
+  const runDir = join(repoRoot, CONFIG.runDirName, runId);
+  const judgeDir = join(runDir, "judge");
+  mkdirSync(judgeDir, { recursive: true });
+  log(onEvent, { phase: "setup", message: `Plan run ${runId} → ${runDir}` });
+
+  // Shared plan-contract text, appended to every persona.
+  const planContract = await readFile(join(personasDir, "plan-contract.md"), "utf8");
+
+  const planOne = async (
+    persona: (typeof CONFIG.personas)[number],
+  ): Promise<PlanAgent> => {
+    const agentDir = join(runDir, persona.id);
+    mkdirSync(agentDir, { recursive: true });
+
+    const personaBody = await readFile(join(personasDir, persona.file), "utf8");
+    const appendSystemPrompt = personaBody + "\n\n" + planContract;
+
+    const transcriptPath = join(agentDir, "transcript.jsonl");
+    const transcriptLines: string[] = [];
+
+    log(onEvent, { agentId: persona.id, phase: "spawn", message: "Planner researching…" });
+    const res = await spawnClaudeAgent({
+      task, // BYTE-IDENTICAL across all three
+      appendSystemPrompt,
+      model: CONFIG.model,
+      cwd: repoRoot, // read-only directly in the repo (plannerTools have no Edit/Write/Bash)
+      allowedTools: CONFIG.plannerTools,
+      maxTurns: CONFIG.plannerMaxTurns,
+      wallClockMs: CONFIG.wallClockMs,
+      onEvent: (evt) => {
+        try {
+          transcriptLines.push(JSON.stringify(evt));
+        } catch {
+          /* ignore unserializable */
+        }
+        log(onEvent, {
+          agentId: persona.id,
+          phase: "spawn",
+          message: evt?.type === "result" ? "planner finished" : `event: ${evt?.type ?? "?"}`,
+        });
+      },
+    });
+
+    const plan = res.resultText.trim();
+    // status: clean exit, not timed out, and a non-empty plan (the final message).
+    const ok = res.exitCode === 0 && !res.timedOut && plan.length > 0;
+
+    writeFileSync(transcriptPath, transcriptLines.join("\n") + "\n", "utf8");
+    writeFileSync(join(agentDir, "plan.md"), plan + "\n", "utf8");
+    writeFileSync(
+      join(agentDir, "meta.json"),
+      JSON.stringify(
+        {
+          id: persona.id,
+          exitCode: res.exitCode,
+          timedOut: res.timedOut,
+          durationMs: res.durationMs,
+          usage: res.usage,
+          stderr: res.stderr,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    if (!ok)
+      log(onEvent, {
+        agentId: persona.id,
+        phase: "spawn",
+        message: `plan failed (exit ${res.exitCode}${res.timedOut ? ", timed out" : ""}${plan.length ? "" : ", empty plan"})`,
+      });
+
+    return {
+      id: persona.id,
+      status: ok ? "ok" : "failed",
+      plan,
+      usage: res.usage,
+      exitCode: res.exitCode,
+      stderr: res.stderr,
+    };
+  };
+
+  log(onEvent, { phase: "spawn", message: `Fanning out ${CONFIG.personas.length} planners…` });
+  // Each planOne converts its own failure into a failed PlanAgent, so Promise.all is safe.
+  const agents = await Promise.all(CONFIG.personas.map(planOne));
+
+  for (const a of agents)
+    log(onEvent, {
+      agentId: a.id,
+      phase: "collect",
+      message: `${a.status === "ok" ? "✓" : "✗"} plan, $${a.usage.cost.toFixed(4)}, ${a.usage.turns} turns`,
+    });
+
+  // Judge the plans (read-only over the repo).
+  log(onEvent, { phase: "judge", message: "Spawning judge to compare plans…" });
+  const rubricText = await readFile(join(personasDir, "plan-rubric.md"), "utf8");
+  const judge = await runPlanJudge({
+    task,
+    agents,
+    judgingDir: judgeDir,
+    rubricText,
+    repoRoot,
+    config: CONFIG,
+    onEvent: (evt) =>
+      log(onEvent, {
+        phase: "judge",
+        message: evt?.type === "result" ? "judge finished" : `judge event: ${evt?.type ?? "?"}`,
+      }),
+  });
+
+  const totals = agents.reduce(
+    (acc, a) => ({ cost: acc.cost + a.usage.cost, turns: acc.turns + a.usage.turns }),
+    { cost: judge.usage.cost, turns: judge.usage.turns },
+  );
+
+  const record: PlanRunRecord = {
+    runId,
+    runDir,
+    task,
+    agents,
+    judge: { verdictMarkdown: judge.verdictMarkdown, verdictJson: judge.verdictJson },
+    totals,
+  };
+
+  writeFileSync(join(runDir, "run.json"), JSON.stringify(record, null, 2), "utf8");
+  log(onEvent, { phase: "done", message: `Done. Total $${totals.cost.toFixed(4)}, ${totals.turns} turns.` });
+
+  return record;
+}
+
+// Phase 2 — IMPLEMENT the approved plan with ONE agent, directly on the working tree
+// (no worktree, no branch). Persists transcript/meta under a fresh impl run dir.
+export async function implementPlan(opts: ImplementOpts): Promise<ImplementResult> {
+  const { repoRoot, personasDir, agentId, plan, task, onEvent } = opts;
+
+  const persona = CONFIG.personas.find((p) => p.id === agentId);
+  if (!persona) throw new Error(`Unknown agent id "${agentId}". Known: ${CONFIG.personas.map((p) => p.id).join(", ")}`);
+
+  const runId = `impl-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const runDir = join(repoRoot, CONFIG.runDirName, runId);
+  mkdirSync(runDir, { recursive: true });
+
+  const personaBody = await readFile(join(personasDir, persona.file), "utf8");
+  const appendSystemPrompt =
+    personaBody +
+    "\n\nYou are implementing an APPROVED plan on the live codebase. Make the changes directly in the working tree. " +
+    "Do not create git branches or worktrees. When done, end with a short summary of what you changed and how to test it.";
+
+  const briefing = [
+    "ORIGINAL TASK:",
+    task,
+    "",
+    `APPROVED PLAN (by the '${agentId}' strategy) — implement it now:`,
+    plan,
+  ].join("\n");
+
+  const transcriptLines: string[] = [];
+  log(onEvent, { agentId, phase: "spawn", message: "Implementing approved plan on main…" });
+
+  const res = await spawnClaudeAgent({
+    task: briefing,
+    appendSystemPrompt,
+    model: CONFIG.model,
+    cwd: repoRoot,
+    allowedTools: CONFIG.implementerTools,
+    maxTurns: CONFIG.maxTurns,
+    wallClockMs: CONFIG.wallClockMs,
+    onEvent: (evt) => {
+      try {
+        transcriptLines.push(JSON.stringify(evt));
+      } catch {
+        /* ignore unserializable */
+      }
+      log(onEvent, {
+        agentId,
+        phase: "spawn",
+        message: evt?.type === "result" ? "implementer finished" : `event: ${evt?.type ?? "?"}`,
+      });
+    },
+  });
+
+  writeFileSync(join(runDir, "transcript.jsonl"), transcriptLines.join("\n") + "\n", "utf8");
+  writeFileSync(
+    join(runDir, "meta.json"),
+    JSON.stringify(
+      { agentId, task, exitCode: res.exitCode, timedOut: res.timedOut, durationMs: res.durationMs, usage: res.usage, stderr: res.stderr },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  log(onEvent, {
+    agentId,
+    phase: "done",
+    message: `${res.timedOut ? "TIMED OUT" : res.exitCode === 0 ? "complete" : `exited ${res.exitCode}`}`,
+  });
+
+  return { exitCode: res.exitCode, timedOut: res.timedOut, resultText: res.resultText, usage: res.usage };
 }
 
 // Re-exported convenience used by index.ts's /dispatch-synthesize (spawn a hybrid).

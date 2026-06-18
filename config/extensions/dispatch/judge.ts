@@ -28,7 +28,19 @@ export interface VerdictJson {
   scores: Record<string, Record<string, number> & { total?: number }>;
   recommendation: string | null;
   rationale: string;
-  allFailed: boolean;
+  allFailed?: boolean; // build mode
+  allViable?: boolean; // plan mode
+}
+
+// A planning-phase agent: it proposed a plan (its final assistant message), it did
+// NOT touch the repo. No worktree, no diff, no RESULT.json.
+export interface PlanAgent {
+  id: string;
+  status: "ok" | "failed";
+  plan: string;
+  usage: SpawnUsage;
+  exitCode: number | null;
+  stderr: string;
 }
 
 export interface JudgeOpts {
@@ -137,6 +149,101 @@ export async function runJudge(opts: JudgeOpts): Promise<JudgeOutcome> {
     cwd: opts.judgingDir,
     allowedTools: opts.config.judgeAllowedTools,
     addDirs: opts.agents.map((a) => a.worktreePath),
+    maxTurns: 60,
+    wallClockMs: opts.config.wallClockMs,
+    onEvent: opts.onEvent,
+  });
+
+  return {
+    verdictMarkdown: res.resultText,
+    verdictJson: readVerdictJson(opts.judgingDir),
+    usage: res.usage,
+  };
+}
+
+// ── PLAN MODE ────────────────────────────────────────────────────────────────
+// Compare three PLANS (read-only). The judge gets the repo via --add-dir (so it can
+// verify file paths/claims) and the three plans inlined in the briefing. It is
+// read-only over the codebase; it writes verdict.json into its own cwd via Bash.
+
+export interface PlanJudgeOpts {
+  task: string;
+  agents: PlanAgent[];
+  judgingDir: string;
+  rubricText: string;
+  repoRoot: string;
+  config: DispatchConfig;
+  onEvent?: (evt: any) => void;
+}
+
+function buildPlanJudgeSystemPrompt(rubricText: string): string {
+  return [
+    rubricText,
+    "",
+    "=== PLAN-JUDGING PROTOCOL (strict) ===",
+    "You are an impartial judge comparing competing PLANS for ONE identical task.",
+    "Nothing has been implemented. The repository is provided to you via --add-dir;",
+    "read it (Read/Grep/Glob/Bash) to verify each plan's file paths and claims.",
+    "",
+    "1. Read the repo to CHECK each plan: do the cited files/APIs exist? Is the approach",
+    "   actually compatible with this codebase? Note misreads and invented paths.",
+    "2. Score each plan 1–5 on EACH of the 6 rubric criteria.",
+    "3. Apply the FEASIBILITY GATE: a plan that would not work CANNOT be recommended,",
+    "   no matter how high its other scores. If NO plan is viable, say so plainly.",
+    "4. Recommend EXACTLY ONE plan to implement, or none if all are unviable.",
+    "",
+    "OUTPUT (in this order), as your final message:",
+    "  (a) A markdown comparison table: rows = plans by agent id, columns = the 6 criteria + Total.",
+    "  (b) A short trade-off narrative (2–5 sentences), noting you verified paths/claims by reading the repo.",
+    "  (c) A recommendation: which plan to implement, with reasoning — or that none are viable.",
+    "  (d) The literal line: Pick one to implement on main: /dispatch-pick <id>  (or refine and re-run)",
+    "",
+    "ALSO write a file named verdict.json in your CURRENT working directory (use Bash, e.g.",
+    "a heredoc to `cat > verdict.json`) with this exact shape:",
+    '  { "scores": { "<agentId>": { "feasibility": n, "completeness": n, "maintainability": n,',
+    '    "risk": n, "simplicity": n, "effort_cost": n, "total": n }, ... },',
+    '    "recommendation": "<agentId>" | null, "rationale": "<one paragraph>", "allViable": true|false }',
+    "Use the EXACT criteria keys shown. Write verdict.json BEFORE finishing.",
+  ].join("\n");
+}
+
+function briefPlanAgent(a: PlanAgent): string {
+  const lines = [
+    `### Plan from agent: ${a.id}  (status ${a.status})`,
+    `Cost/turns: $${a.usage.cost.toFixed(4)} over ${a.usage.turns} turns.`,
+  ];
+  if (a.status === "ok" && a.plan.trim()) {
+    lines.push("", a.plan.trim());
+  } else {
+    lines.push(
+      `Exit code: ${a.exitCode}${a.stderr ? `  | stderr (tail): ${a.stderr.slice(-500)}` : ""}`,
+      `THIS AGENT PRODUCED NO USABLE PLAN — treat it as a failed/unviable submission.`,
+    );
+  }
+  return lines.join("\n");
+}
+
+export async function runPlanJudge(opts: PlanJudgeOpts): Promise<JudgeOutcome> {
+  const briefing = [
+    `TASK GIVEN TO ALL AGENTS (byte-identical):`,
+    opts.task,
+    "",
+    `There are ${opts.agents.length} competing PLANS below (inlined). The repository is at`,
+    `${opts.repoRoot} and is passed to you via --add-dir; read it to verify each plan's claims.`,
+    "",
+    ...opts.agents.map(briefPlanAgent),
+    "",
+    `Now follow the PLAN-JUDGING PROTOCOL in your system prompt: verify against the repo,`,
+    `score, gate, output, and write verdict.json into your current working directory (${opts.judgingDir}).`,
+  ].join("\n\n");
+
+  const res = await spawnClaudeAgent({
+    task: briefing,
+    appendSystemPrompt: buildPlanJudgeSystemPrompt(opts.rubricText),
+    model: opts.config.judgeModel,
+    cwd: opts.judgingDir,
+    allowedTools: opts.config.judgeAllowedTools,
+    addDirs: [opts.repoRoot],
     maxTurns: 60,
     wallClockMs: opts.config.wallClockMs,
     onEvent: opts.onEvent,

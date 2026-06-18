@@ -15,16 +15,20 @@ The router doesn't guess from keywords — it watches which tools the LLM reache
 
 ## Dispatch / Judge (multi-strategy agents)
 
-**By default, any prompt you type in `pi` runs the three agents** — the same task through three competing Claude Code agents — **Hustler** (laziest viable path), **Engineer** (by the book), **Native** (baseline) — each in its own isolated git worktree, then a **judge** independently re-runs their tests and scores them on a 7-criteria rubric. (No `/dispatch` prefix needed; launch `pi` from the target repo.)
+**By default, any prompt you type in `pi` becomes a plan-first dispatch.** Three competing Claude Code agents — **Hustler** (laziest viable path), **Engineer** (by the book), **Native** (baseline) — each **research and propose a plan** for the same task (read-only — no code changes, no worktrees). A **judge** reads the repo to verify each plan's claims, scores them on a 6-criteria rubric, and recommends one. Then **you pick one** and a single agent implements it on `main`. No `/dispatch` prefix needed; launch `pi` from the target repo.
 
-The implementers and judge run as headless **Claude Code** processes under your **subscription** (no metered API credits — keep `ANTHROPIC_API_KEY` unset and `claude` logged in). Pi itself makes no LLM calls for dispatch; it's pure orchestration.
+The agents and judge run as headless **Claude Code** processes under your **subscription** (no metered API credits — keep `ANTHROPIC_API_KEY` unset and `claude` logged in). Pi itself makes no LLM calls for dispatch; it's pure orchestration.
 
 ```
-<just type your task>       fan out 3 strategies → judge verdict + recommendation (DEFAULT)
-/dispatch <task>            the same, explicitly
+<just type your task>       3 agents PROPOSE plans (read-only) → judge recommends one (DEFAULT)
+/dispatch-pick <id>         implement the chosen plan on main (one agent, reviewable via git diff)
+/dispatch <task>            the same plan flow, explicitly
 /chat <prompt>              run ONE normal single-agent Pi turn instead (model-router)
 /dispatch-mode on|off       toggle dispatch-by-default
-/dispatch-promote <id>      merge a winner (agent/hustler|engineer|native) into main
+
+# Build mode (optional): actually implement all three and compare, in isolated worktrees
+/dispatch-build <task>      3 agents IMPLEMENT competing solutions + judge
+/dispatch-promote <id>      merge a build winner (agent/hustler|engineer|native) into main
 /dispatch-synthesize        build a hybrid of the three on agent/synthesis
 ```
 

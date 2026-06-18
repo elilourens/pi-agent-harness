@@ -1,79 +1,90 @@
 // index.ts — the Pi extension (cockpit). Thin: all heavy logic lives in the core
 // modules (orchestrate / spawn / judge / worktree).
 //
-// DEFAULT BEHAVIOR: a freeform prompt typed at the normal Pi input fans out to the
-// THREE strategy agents (hustler/engineer/native) + judge — it does NOT run a normal
-// single-agent LLM turn. This is done via the `input` event returning
-// { action: "handled" }, which cancels Pi's normal turn before the agent loop runs.
+// DEFAULT BEHAVIOR (PLAN MODE): a freeform prompt typed at the normal Pi input fans
+// out to the THREE strategy agents (hustler/engineer/native), which RESEARCH and
+// PROPOSE a plan (read-only — they do NOT touch the repo) + a judge that recommends
+// one plan. It does NOT run a normal single-agent LLM turn. This is done via the
+// `input` event returning { action: "handled" }, which cancels Pi's normal turn.
+//
+// Then you /dispatch-pick <id> to implement the chosen plan directly on main.
 //
 // Escape hatch: /chat <prompt> runs a normal single-agent Pi turn (model-router applies).
 // Toggle:       /dispatch-mode on|off  flips the default.
 //
 // Commands:
-//   /dispatch <task>          — explicit fan-out (same as the default behavior).
+//   /dispatch <task>          — PLAN mode: 3 agents propose plans + judge (default behavior).
+//   /dispatch-pick <id>       — implement the chosen plan on main.
+//   /dispatch-build <task>    — BUILD mode: 3 agents implement in isolated worktrees + judge.
 //   /chat <prompt>            — normal single-agent Pi turn (bypass dispatch).
 //   /dispatch-mode on|off     — freeform prompts dispatch (on) or run normal Pi (off).
-//   /dispatch-promote <id>    — merge the chosen agent's branch into main.
-//   /dispatch-synthesize      — spawn a hybrid from the last run's worktrees + verdict.
+//   /dispatch-promote <id>    — (build mode) merge the chosen agent's branch into main.
+//   /dispatch-synthesize      — (build mode) spawn a hybrid from the last build's worktrees + verdict.
 
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CONFIG } from "./config.ts";
-import { dispatch, gitCheckoutNewBranch, type RunRecord } from "./orchestrate.ts";
+import {
+  dispatch,
+  dispatchPlan,
+  implementPlan,
+  gitCheckoutNewBranch,
+  type PlanRunRecord,
+  type RunRecord,
+} from "./orchestrate.ts";
 import { promoteBranch } from "./worktree.ts";
 import { spawnClaudeAgent } from "./spawn.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 export default function (pi: ExtensionAPI) {
-  // Last run record, so /dispatch-promote and /dispatch-synthesize can act on it.
-  let lastRun: RunRecord | null = null;
+  // Last PLAN run (default mode), so /dispatch-pick can implement a chosen plan.
+  let lastPlanRun: PlanRunRecord | null = null;
+  // Last BUILD run, so /dispatch-promote and /dispatch-synthesize can act on it.
+  let lastBuildRun: RunRecord | null = null;
   // Whether freeform prompts fan out to 3 agents (true) or run normal Pi (false).
   let dispatchDefault = true;
 
-  // Shared: run a dispatch, store it, and render summary + verdict via the UI.
-  async function runDispatch(task: string, ctx: any) {
-    ctx.ui.notify(`Dispatching 3 agents on: ${task}`, "info");
-    const record = await dispatch({
+  // Shared: run a PLAN dispatch, store it, and render the plans + verdict via the UI.
+  async function runPlanDispatch(task: string, ctx: any) {
+    ctx.ui.notify(`Planning with 3 agents on: ${task}`, "info");
+    const record = await dispatchPlan({
       task,
       repoRoot: ctx.cwd,
       personasDir: HERE,
       onEvent: (e) =>
         ctx.ui.notify(`[${e.phase}${e.agentId ? `:${e.agentId}` : ""}] ${e.message}`, "info"),
     });
-    lastRun = record;
+    lastPlanRun = record;
 
-    const summary = record.agents
-      .map(
-        (a) =>
-          `${a.status === "ok" ? "✓" : "✗"} ${a.id} — ${a.filesChanged.length} files, ` +
-          `$${a.usage.cost.toFixed(4)}, ${a.usage.turns} turns`,
-      )
-      .join("\n");
+    // Each agent's full plan, with a header.
+    for (const a of record.agents) {
+      ctx.ui.notify(
+        [
+          `=== PLAN: ${a.id} (${a.status === "ok" ? "✓" : "✗ failed"}) — ` +
+            `$${a.usage.cost.toFixed(4)}, ${a.usage.turns} turns ===`,
+          a.status === "ok" && a.plan ? a.plan : "(no plan produced)",
+        ].join("\n"),
+        "info",
+      );
+    }
 
     ctx.ui.notify(
       [
-        `Dispatch ${record.runId} complete.`,
-        summary,
-        `Totals: $${record.totals.cost.toFixed(4)} over ${record.totals.turns} turns.`,
+        `Plan run ${record.runId} complete. Totals: $${record.totals.cost.toFixed(4)} over ${record.totals.turns} turns.`,
         `Run dir: ${record.runDir}`,
-      ].join("\n"),
-      "info",
-    );
-
-    ctx.ui.notify(
-      [
+        "",
         "=== JUDGE VERDICT ===",
         record.judge.verdictMarkdown || "(judge produced no text output)",
         "",
-        "Next: /dispatch-promote <agentId>  or  /dispatch-synthesize",
+        `Pick one to implement on main: /dispatch-pick <id>  (available: ${record.agents.map((a) => a.id).join(", ")})`,
       ].join("\n"),
       "info",
     );
   }
 
-  // ── DEFAULT: freeform prompt → 3-agent dispatch ──────────────────────────────
+  // ── DEFAULT: freeform prompt → 3-agent PLAN dispatch ─────────────────────────
   // Returning { action: "handled" } cancels the normal LLM turn entirely.
   pi.on("input", async (event, ctx) => {
     // Never intercept messages our own commands inject (would loop on /chat).
@@ -82,11 +93,11 @@ export default function (pi: ExtensionAPI) {
     if (!dispatchDefault) return { action: "continue" };
     const text = (event.text ?? "").trim();
     if (!text) return { action: "continue" };
-    // Let slash-commands (/chat, /dispatch-promote, /opus, …) through untouched.
+    // Let slash-commands (/chat, /dispatch-pick, /opus, …) through untouched.
     if (text.startsWith("/")) return { action: "continue" };
 
     try {
-      await runDispatch(text, ctx);
+      await runPlanDispatch(text, ctx);
     } catch (err) {
       ctx.ui.notify(
         `Dispatch failed: ${(err as Error).message}\n` +
@@ -130,39 +141,137 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Explicit dispatch (same as the default behavior) ──────────────────────────
+  // ── Explicit PLAN dispatch (same as the default behavior) ─────────────────────
   pi.registerCommand("dispatch", {
-    description: "Fan out 3 strategy agents (hustler/engineer/native) on one task, then judge them",
+    description: "PLAN mode: 3 strategy agents (hustler/engineer/native) propose plans (read-only), then judge them",
     handler: async (args: string, ctx: any) => {
       const task = (args ?? "").trim();
       if (!task)
         return ctx.ui.notify(
-          "Usage: /dispatch <task>\nRuns 3 competing Claude Code agents in isolated git worktrees, then judges them.",
+          "Usage: /dispatch <task>\nRuns 3 competing agents that RESEARCH and PROPOSE plans (no code changes), then judges them.\nThen: /dispatch-pick <id> to implement the chosen plan on main.",
           "info",
         );
       try {
-        await runDispatch(task, ctx);
+        await runPlanDispatch(task, ctx);
       } catch (err) {
         ctx.ui.notify(`Dispatch failed: ${(err as Error).message}`, "error");
       }
     },
   });
 
-  pi.registerCommand("dispatch-promote", {
-    description: "Merge a dispatched agent's branch into main (e.g. /dispatch-promote engineer)",
+  // ── PICK & IMPLEMENT a plan on main ───────────────────────────────────────────
+  pi.registerCommand("dispatch-pick", {
+    description: "Implement a proposed plan on main (e.g. /dispatch-pick engineer)",
     handler: async (args: string, ctx: any) => {
       const id = (args ?? "").trim();
-      if (!lastRun) return ctx.ui.notify("No dispatch run in this session. Run a task first.", "error");
+      if (!lastPlanRun) return ctx.ui.notify("Run a task first to get plans.", "error");
       if (!id)
         return ctx.ui.notify(
-          `Usage: /dispatch-promote <agentId>\nAvailable: ${lastRun.agents.map((a) => a.id).join(", ")}`,
+          `Usage: /dispatch-pick <id>\nAvailable: ${lastPlanRun.agents.map((a) => a.id).join(", ")}`,
           "info",
         );
 
-      const agent = lastRun.agents.find((a) => a.id === id);
+      const agent = lastPlanRun.agents.find((a) => a.id === id);
       if (!agent)
         return ctx.ui.notify(
-          `Unknown agent "${id}". Available: ${lastRun.agents.map((a) => a.id).join(", ")}`,
+          `Unknown plan "${id}". Available: ${lastPlanRun.agents.map((a) => a.id).join(", ")}`,
+          "error",
+        );
+      if (agent.status !== "ok" || !agent.plan.trim())
+        return ctx.ui.notify(`Plan "${id}" failed or is empty — pick another.`, "error");
+
+      try {
+        ctx.ui.notify(`Implementing the '${id}' plan on main…`, "info");
+        const res = await implementPlan({
+          repoRoot: ctx.cwd,
+          personasDir: HERE,
+          agentId: id,
+          plan: agent.plan,
+          task: lastPlanRun.task,
+          onEvent: (e) =>
+            ctx.ui.notify(`[${e.phase}${e.agentId ? `:${e.agentId}` : ""}] ${e.message}`, "info"),
+        });
+
+        ctx.ui.notify(
+          [
+            `Implementation ${res.timedOut ? "TIMED OUT" : res.exitCode === 0 ? "complete" : `exited ${res.exitCode}`} ` +
+              `($${res.usage.cost.toFixed(4)}, ${res.usage.turns} turns).`,
+            res.resultText ? `\n${res.resultText}` : "",
+            "",
+            "Review with `git diff`; keep it or `git checkout .` to discard.",
+          ].join("\n"),
+          res.exitCode === 0 && !res.timedOut ? "info" : "error",
+        );
+      } catch (err) {
+        ctx.ui.notify(`Implement failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  // ── BUILD mode: the OLD competitive-implementation flow (worktrees + judge) ────
+  pi.registerCommand("dispatch-build", {
+    description: "BUILD mode: 3 agents IMPLEMENT in isolated git worktrees, then judge them",
+    handler: async (args: string, ctx: any) => {
+      const task = (args ?? "").trim();
+      if (!task)
+        return ctx.ui.notify(
+          "Usage: /dispatch-build <task>\nRuns 3 competing Claude Code agents in isolated git worktrees, then judges them.\nThen: /dispatch-promote <id> or /dispatch-synthesize.",
+          "info",
+        );
+      try {
+        ctx.ui.notify(`Building with 3 agents on: ${task}`, "info");
+        const record = await dispatch({
+          task,
+          repoRoot: ctx.cwd,
+          personasDir: HERE,
+          onEvent: (e) =>
+            ctx.ui.notify(`[${e.phase}${e.agentId ? `:${e.agentId}` : ""}] ${e.message}`, "info"),
+        });
+        lastBuildRun = record;
+
+        const summary = record.agents
+          .map(
+            (a) =>
+              `${a.status === "ok" ? "✓" : "✗"} ${a.id} — ${a.filesChanged.length} files, ` +
+              `$${a.usage.cost.toFixed(4)}, ${a.usage.turns} turns`,
+          )
+          .join("\n");
+
+        ctx.ui.notify(
+          [
+            `Build ${record.runId} complete.`,
+            summary,
+            `Totals: $${record.totals.cost.toFixed(4)} over ${record.totals.turns} turns.`,
+            `Run dir: ${record.runDir}`,
+            "",
+            "=== JUDGE VERDICT ===",
+            record.judge.verdictMarkdown || "(judge produced no text output)",
+            "",
+            "Next: /dispatch-promote <agentId>  or  /dispatch-synthesize",
+          ].join("\n"),
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`Build failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("dispatch-promote", {
+    description: "(build mode) Merge a built agent's branch into main (e.g. /dispatch-promote engineer)",
+    handler: async (args: string, ctx: any) => {
+      const id = (args ?? "").trim();
+      if (!lastBuildRun) return ctx.ui.notify("No build run in this session. Run /dispatch-build first.", "error");
+      if (!id)
+        return ctx.ui.notify(
+          `Usage: /dispatch-promote <agentId>\nAvailable: ${lastBuildRun.agents.map((a) => a.id).join(", ")}`,
+          "info",
+        );
+
+      const agent = lastBuildRun.agents.find((a) => a.id === id);
+      if (!agent)
+        return ctx.ui.notify(
+          `Unknown agent "${id}". Available: ${lastBuildRun.agents.map((a) => a.id).join(", ")}`,
           "error",
         );
 
@@ -176,19 +285,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("dispatch-synthesize", {
-    description: "Spawn an opus agent to synthesize a hybrid of the last run onto branch agent/synthesis",
+    description: "(build mode) Spawn an opus agent to synthesize a hybrid of the last build onto branch agent/synthesis",
     handler: async (_args: string, ctx: any) => {
-      if (!lastRun) return ctx.ui.notify("No dispatch run in this session. Run a task first.", "error");
+      if (!lastBuildRun) return ctx.ui.notify("No build run in this session. Run /dispatch-build first.", "error");
 
       const branch = "agent/synthesis";
       try {
         await gitCheckoutNewBranch(ctx.cwd, branch);
 
-        const verdict = lastRun.judge.verdictMarkdown || "(no verdict text)";
+        const verdict = lastBuildRun.judge.verdictMarkdown || "(no verdict text)";
         const briefing = [
-          `You are synthesizing a HYBRID solution from ${lastRun.agents.length} competing attempts at this task:`,
+          `You are synthesizing a HYBRID solution from ${lastBuildRun.agents.length} competing attempts at this task:`,
           "",
-          lastRun.task,
+          lastBuildRun.task,
           "",
           "The judge's verdict comparing the attempts:",
           verdict,
@@ -206,7 +315,7 @@ export default function (pi: ExtensionAPI) {
           model: CONFIG.model,
           cwd: ctx.cwd,
           allowedTools: CONFIG.allowedTools,
-          addDirs: lastRun.agents.map((a) => a.worktreePath),
+          addDirs: lastBuildRun.agents.map((a) => a.worktreePath),
           maxTurns: CONFIG.maxTurns,
           wallClockMs: CONFIG.wallClockMs,
           onEvent: (evt) =>
