@@ -15,12 +15,15 @@ The router doesn't guess from keywords — it watches which tools the LLM reache
 
 ## Dispatch / Judge (multi-strategy agents)
 
-`/dispatch <task>` runs the **same task** through three competing Claude Code agents — **Hustler** (laziest viable path), **Engineer** (by the book), **Native** (baseline) — each in its own isolated git worktree, then a **judge** independently re-runs their tests and scores them on a 7-criteria rubric.
+**By default, any prompt you type in `pi` runs the three agents** — the same task through three competing Claude Code agents — **Hustler** (laziest viable path), **Engineer** (by the book), **Native** (baseline) — each in its own isolated git worktree, then a **judge** independently re-runs their tests and scores them on a 7-criteria rubric. (No `/dispatch` prefix needed; launch `pi` from the target repo.)
 
-The implementers and judge run as headless **Claude Code** processes under your **subscription** (no metered API credits — keep `ANTHROPIC_API_KEY` unset and `claude` logged in). Pi itself makes no LLM calls for this; it's pure orchestration.
+The implementers and judge run as headless **Claude Code** processes under your **subscription** (no metered API credits — keep `ANTHROPIC_API_KEY` unset and `claude` logged in). Pi itself makes no LLM calls for dispatch; it's pure orchestration.
 
 ```
-/dispatch <task>            fan out 3 strategies → judge verdict + recommendation
+<just type your task>       fan out 3 strategies → judge verdict + recommendation (DEFAULT)
+/dispatch <task>            the same, explicitly
+/chat <prompt>              run ONE normal single-agent Pi turn instead (model-router)
+/dispatch-mode on|off       toggle dispatch-by-default
 /dispatch-promote <id>      merge a winner (agent/hustler|engineer|native) into main
 /dispatch-synthesize        build a hybrid of the three on agent/synthesis
 ```

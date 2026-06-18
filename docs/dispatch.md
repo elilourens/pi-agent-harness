@@ -23,14 +23,23 @@ Give one task to three competing Claude Code agents, each pursuing a different *
 
 ## Invoke
 
-Inside `pi`:
+**Dispatch is the default.** Launch `pi` from the repo you want to work on and just type your task as a normal prompt — it fans out to the three agents automatically (no `/dispatch` prefix needed):
 
 ```
-/dispatch implement parseDuration in examples/sample-task/duration.mjs so `node --test examples/sample-task/` passes; see its README
+cd ~/sites/my-site && pi
+> redesign the homepage hero — bigger headline, new CTA, keep it responsive
 ```
+
+The same thing explicitly: `/dispatch <task>`.
 
 - The repo must be **clean** (`git status` empty) — worktrees are cut from `HEAD`, so whatever the agents need must be committed.
 - Watch progress in the status notifications. On completion you get a per-agent summary (✓/✗, files, cost, turns), the judge's verdict (comparison table + recommendation), and the run directory.
+
+### Normal Pi (single agent) when you want it
+
+- `/chat <prompt>` — run one normal single-agent Pi turn (the model-router applies; uses your API key). Use this for quick questions you don't want to fan out.
+- `/dispatch-mode off` — make freeform prompts behave like normal Pi again; `/dispatch-mode on` restores dispatch-by-default. (`/dispatch <task>` still works either way.)
+- Slash commands (anything starting with `/`) are never intercepted, so all your routing commands (`/opus`, `/router-status`, …) keep working.
 
 Standalone (no Pi):
 
