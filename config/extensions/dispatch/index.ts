@@ -32,7 +32,12 @@ import {
   type PlanRunRecord,
   type RunRecord,
 } from "./orchestrate.ts";
-import { promoteBranch } from "./worktree.ts";
+import {
+  promoteBranch,
+  isCleanTree,
+  changedEntries,
+  restoreWorkingTree,
+} from "./worktree.ts";
 import { spawnClaudeAgent } from "./spawn.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -57,16 +62,26 @@ export default function (pi: ExtensionAPI) {
     return "";
   }
 
-  // Implement a chosen plan on main. Shared by the popup picker and /dispatch-pick.
+  // Implement a chosen plan on main, then offer a friendly Keep/Undo review (no git).
+  // Shared by the popup picker and /dispatch-pick.
   async function implementChosen(run: PlanRunRecord, id: string, ctx: any) {
     const agent = run.agents.find((a) => a.id === id);
     if (!agent) return ctx.ui.notify(`Unknown plan "${id}".`, "error");
     if (agent.status !== "ok" || !agent.plan.trim())
       return ctx.ui.notify(`Plan "${id}" failed or is empty — pick another.`, "error");
 
+    // Snapshot cleanliness BEFORE the change so we know whether Undo can be automatic.
+    let cleanBefore = false;
     try {
-      ctx.ui.notify(`Implementing the '${id}' plan on main…`, "info");
-      const res = await implementPlan({
+      cleanBefore = await isCleanTree(ctx.cwd);
+    } catch {
+      /* not a git repo or git unavailable — treat as not-clean (manual undo) */
+    }
+
+    let res;
+    try {
+      ctx.ui.notify(`Implementing the '${id}' approach…`, "info");
+      res = await implementPlan({
         repoRoot: ctx.cwd,
         personasDir: HERE,
         agentId: id,
@@ -75,18 +90,60 @@ export default function (pi: ExtensionAPI) {
         onEvent: (e) =>
           ctx.ui.notify(`[${e.phase}${e.agentId ? `:${e.agentId}` : ""}] ${e.message}`, "info"),
       });
-      ctx.ui.notify(
-        [
-          `Implementation ${res.timedOut ? "TIMED OUT" : res.exitCode === 0 ? "complete" : `exited ${res.exitCode}`} ` +
-            `($${res.usage.cost.toFixed(4)}, ${res.usage.turns} turns).`,
-          res.resultText ? `\n${res.resultText}` : "",
-          "",
-          "Review with `git diff`; keep it or `git checkout .` to discard.",
-        ].join("\n"),
-        res.exitCode === 0 && !res.timedOut ? "info" : "error",
-      );
     } catch (err) {
-      ctx.ui.notify(`Implement failed: ${(err as Error).message}`, "error");
+      return ctx.ui.notify(`Implement failed: ${(err as Error).message}`, "error");
+    }
+
+    // Friendly summary: plain-English "what it did" + a list of files touched (no diff).
+    const entries = await changedEntries(ctx.cwd);
+    const fileList = entries.length
+      ? entries.map((e) => `  • ${e.label}: ${e.path}`).join("\n")
+      : "  (no file changes detected)";
+    const ok = res.exitCode === 0 && !res.timedOut;
+    ctx.ui.notify(
+      [
+        ok
+          ? `✅ Done — implemented the '${id}' approach.`
+          : `⚠️ The '${id}' agent ${res.timedOut ? "timed out" : `exited ${res.exitCode}`} (it may have changed some files).`,
+        res.resultText ? `\nWhat it did:\n${res.resultText}` : "",
+        `\nFiles changed:\n${fileList}`,
+      ].join("\n"),
+      ok ? "info" : "error",
+    );
+
+    if (entries.length === 0) return; // nothing to keep or undo
+
+    // Keep / Undo — buttons instead of git.
+    const KEEP = "✓  Keep these changes";
+    const UNDO = "↩  Undo — put everything back the way it was";
+    if (!ctx.hasUI) {
+      ctx.ui.notify(
+        cleanBefore
+          ? "Keep them, or undo with: git reset --hard HEAD && git clean -fd"
+          : "You had uncommitted changes before this ran; review the files above manually.",
+        "info",
+      );
+      return;
+    }
+
+    const choice = await ctx.ui.select(`Keep the '${id}' changes?`, [KEEP, UNDO]);
+    if (choice === UNDO) {
+      if (!cleanBefore) {
+        ctx.ui.notify(
+          "Can't auto-undo: you had uncommitted changes before this ran, so I won't risk clobbering them. " +
+            "Revert the files listed above yourself (your editor's git panel, or `git checkout -- <file>`).",
+          "error",
+        );
+        return;
+      }
+      try {
+        await restoreWorkingTree(ctx.cwd);
+        ctx.ui.notify("↩  Undone — your project is back exactly how it was.", "info");
+      } catch (err) {
+        ctx.ui.notify(`Undo failed: ${(err as Error).message}`, "error");
+      }
+    } else {
+      ctx.ui.notify("✓  Kept. The changes are in your project — commit them whenever you're ready.", "info");
     }
   }
 

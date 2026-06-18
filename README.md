@@ -22,7 +22,7 @@ The agents and judge run as headless **Claude Code** processes under your **subs
 ```
 <just type your task>       3 agents PROPOSE plans (read-only) → judge recommends one →
                             a POPUP asks you to pick → the chosen plan is implemented on
-                            main by one agent (reviewable via git diff). No slash commands.
+                            main → a Keep / Undo popup (no git). No slash commands.
 /dispatch <task>            the same plan flow, explicitly
 /dispatch-pick <id>         manual fallback to implement a plan without the popup
 /chat <prompt>              run ONE normal single-agent Pi turn instead (model-router)

@@ -35,7 +35,8 @@ cd ~/sites/my-site && pi
 
 - Planners are **read-only** (`Read/Grep/Glob/WebSearch/WebFetch` — no Edit/Write/Bash), so they **cannot modify your repo**. No worktrees, no branches, and **no clean-repo requirement** — you can plan against an in-progress tree.
 - You get each agent's full plan, then the judge's comparison table + recommendation.
-- Then a **popup** appears (`ctx.ui.select`) listing the approaches with the judge's pick marked ⭐. **Choose one** and that plan is implemented **directly on your working tree** by one agent — no slash commands. Pick **"Skip"** to do nothing. Review the result with `git diff`; keep it, commit it, or `git checkout .` to discard. (Picking on a dirty tree mixes the new changes with your existing ones — start clean if you want a clean diff.)
+- Then a **popup** appears (`ctx.ui.select`) listing the approaches with the judge's pick marked ⭐. **Choose one** and that plan is implemented **directly on your working tree** by one agent — no slash commands. Pick **"Skip"** to do nothing.
+- **Review with Keep / Undo (no git):** when it finishes you get a plain-English summary of what it did + the list of files it changed, then a second popup: **Keep** (leave the changes — commit when you're ready) or **Undo** (it rolls everything back automatically — `git reset --hard HEAD && git clean -fd` under the hood). Undo is only offered as automatic when your tree was **clean** before the run; if you had uncommitted changes, it tells you to revert manually so it can't clobber your work. So: **start from a clean repo** to get one-click Undo.
 - Manual fallback (or non-interactive mode, where no popup is possible): `/dispatch-pick <id>` does the same implement step.
 - Or just don't pick — refine your prompt and re-run, or do something else entirely.
 

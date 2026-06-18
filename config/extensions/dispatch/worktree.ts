@@ -109,6 +109,53 @@ export async function filesChanged(
     .filter(Boolean);
 }
 
+// ── Working-tree review/undo helpers (used by the friendly Keep/Undo flow) ──────
+
+// Is the working tree clean (no staged, unstaged, or untracked-non-ignored changes)?
+export async function isCleanTree(repoRoot: string): Promise<boolean> {
+  return (await git(repoRoot, ["status", "--porcelain"])).trim() === "";
+}
+
+// Friendly list of what changed: [{ label: "new"|"modified"|"deleted"|…, path }].
+export async function changedEntries(
+  repoRoot: string,
+): Promise<{ label: string; path: string }[]> {
+  let out = "";
+  try {
+    out = await git(repoRoot, ["status", "--porcelain"]);
+  } catch {
+    return [];
+  }
+  return out
+    .split("\n")
+    .map((l) => l.replace(/\r$/, ""))
+    .filter(Boolean)
+    .map((l) => {
+      const code = l.slice(0, 2);
+      const path = l.slice(3);
+      const label =
+        code === "??"
+          ? "new"
+          : code.includes("D")
+            ? "deleted"
+            : code.includes("R")
+              ? "renamed"
+              : code.includes("A")
+                ? "added"
+                : "modified";
+      return { label, path };
+    });
+}
+
+// Roll the working tree back to HEAD: revert all tracked changes (staged or not) and
+// remove newly-created untracked files/dirs (gitignored files like node_modules are
+// preserved — no -x). Only safe to call when the tree was clean before the change;
+// the caller guarantees that.
+export async function restoreWorkingTree(repoRoot: string): Promise<void> {
+  await git(repoRoot, ["reset", "--hard", "HEAD"]);
+  await git(repoRoot, ["clean", "-fd"]);
+}
+
 // Best-effort teardown; swallow errors (worktree may already be gone).
 export async function removeWorktree(repoRoot: string, path: string): Promise<void> {
   try {
