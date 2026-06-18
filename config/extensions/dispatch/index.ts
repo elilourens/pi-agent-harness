@@ -50,6 +50,12 @@ export default function (pi: ExtensionAPI) {
   // Whether freeform prompts fan out to 3 agents (true) or run normal Pi (false).
   let dispatchDefault = true;
 
+  // Status badge so it's obvious that typing a task fans out to 3× Opus (NOT the
+  // model-router's Fable session model, which only applies to /chat). Cleared when off.
+  const setDispatchBadge = (ctx: any) =>
+    ctx?.ui?.setStatus?.("dispatch", dispatchDefault ? "⚡ type → 3×Opus" : undefined);
+  pi.on("session_start", async (_e: any, ctx: any) => setDispatchBadge(ctx));
+
   // First non-empty line under a plan's "## Approach" heading — used as a picker hint.
   function approachSnippet(plan: string): string {
     const lines = plan.split(/\r?\n/);
@@ -254,6 +260,7 @@ export default function (pi: ExtensionAPI) {
           `Dispatch-as-default is currently ${dispatchDefault ? "ON" : "OFF"}.\nUsage: /dispatch-mode on|off`,
           "info",
         );
+      setDispatchBadge(ctx);
       ctx.ui.notify(
         dispatchDefault
           ? "Dispatch-as-default ON — freeform prompts fan out to 3 agents. (/chat for a normal turn.)"
