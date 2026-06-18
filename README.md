@@ -20,9 +20,11 @@ The router doesn't guess from keywords — it watches which tools the LLM reache
 The agents and judge run as headless **Claude Code** processes under your **subscription** (no metered API credits — keep `ANTHROPIC_API_KEY` unset and `claude` logged in). Pi itself makes no LLM calls for dispatch; it's pure orchestration.
 
 ```
-<just type your task>       3 agents PROPOSE plans (read-only) → judge recommends one (DEFAULT)
-/dispatch-pick <id>         implement the chosen plan on main (one agent, reviewable via git diff)
+<just type your task>       3 agents PROPOSE plans (read-only) → judge recommends one →
+                            a POPUP asks you to pick → the chosen plan is implemented on
+                            main by one agent (reviewable via git diff). No slash commands.
 /dispatch <task>            the same plan flow, explicitly
+/dispatch-pick <id>         manual fallback to implement a plan without the popup
 /chat <prompt>              run ONE normal single-agent Pi turn instead (model-router)
 /dispatch-mode on|off       toggle dispatch-by-default
 

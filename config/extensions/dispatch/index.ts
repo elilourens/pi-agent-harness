@@ -1,20 +1,19 @@
 // index.ts — the Pi extension (cockpit). Thin: all heavy logic lives in the core
 // modules (orchestrate / spawn / judge / worktree).
 //
-// DEFAULT BEHAVIOR (PLAN MODE): a freeform prompt typed at the normal Pi input fans
-// out to the THREE strategy agents (hustler/engineer/native), which RESEARCH and
-// PROPOSE a plan (read-only — they do NOT touch the repo) + a judge that recommends
-// one plan. It does NOT run a normal single-agent LLM turn. This is done via the
-// `input` event returning { action: "handled" }, which cancels Pi's normal turn.
-//
-// Then you /dispatch-pick <id> to implement the chosen plan directly on main.
+// DEFAULT BEHAVIOR (PLAN MODE — no slash commands needed): you just type a task at the
+// normal Pi input. That fans out to THREE strategy agents (hustler/engineer/native),
+// which RESEARCH and PROPOSE a plan (read-only — they do NOT touch the repo); a judge
+// recommends one; then a POPUP (ctx.ui.select) asks you to pick an approach, and the
+// chosen plan is implemented on main by ONE agent. The normal single-agent LLM turn is
+// cancelled via the `input` event returning { action: "handled" }.
 //
 // Escape hatch: /chat <prompt> runs a normal single-agent Pi turn (model-router applies).
 // Toggle:       /dispatch-mode on|off  flips the default.
 //
-// Commands:
-//   /dispatch <task>          — PLAN mode: 3 agents propose plans + judge (default behavior).
-//   /dispatch-pick <id>       — implement the chosen plan on main.
+// Commands (all optional — the default flow is driven by typing + the popup):
+//   /dispatch <task>          — PLAN mode explicitly (same as just typing): plans → popup → implement.
+//   /dispatch-pick <id>       — manual fallback to implement a plan without the popup.
 //   /dispatch-build <task>    — BUILD mode: 3 agents implement in isolated worktrees + judge.
 //   /chat <prompt>            — normal single-agent Pi turn (bypass dispatch).
 //   /dispatch-mode on|off     — freeform prompts dispatch (on) or run normal Pi (off).
@@ -46,9 +45,55 @@ export default function (pi: ExtensionAPI) {
   // Whether freeform prompts fan out to 3 agents (true) or run normal Pi (false).
   let dispatchDefault = true;
 
-  // Shared: run a PLAN dispatch, store it, and render the plans + verdict via the UI.
-  async function runPlanDispatch(task: string, ctx: any) {
-    ctx.ui.notify(`Planning with 3 agents on: ${task}`, "info");
+  // First non-empty line under a plan's "## Approach" heading — used as a picker hint.
+  function approachSnippet(plan: string): string {
+    const lines = plan.split(/\r?\n/);
+    const i = lines.findIndex((l) => /^#+\s*approach\b/i.test(l.trim()));
+    if (i >= 0)
+      for (let j = i + 1; j < lines.length; j++) {
+        const t = lines[j].trim();
+        if (t) return t.length > 72 ? t.slice(0, 72) + "…" : t;
+      }
+    return "";
+  }
+
+  // Implement a chosen plan on main. Shared by the popup picker and /dispatch-pick.
+  async function implementChosen(run: PlanRunRecord, id: string, ctx: any) {
+    const agent = run.agents.find((a) => a.id === id);
+    if (!agent) return ctx.ui.notify(`Unknown plan "${id}".`, "error");
+    if (agent.status !== "ok" || !agent.plan.trim())
+      return ctx.ui.notify(`Plan "${id}" failed or is empty — pick another.`, "error");
+
+    try {
+      ctx.ui.notify(`Implementing the '${id}' plan on main…`, "info");
+      const res = await implementPlan({
+        repoRoot: ctx.cwd,
+        personasDir: HERE,
+        agentId: id,
+        plan: agent.plan,
+        task: run.task,
+        onEvent: (e) =>
+          ctx.ui.notify(`[${e.phase}${e.agentId ? `:${e.agentId}` : ""}] ${e.message}`, "info"),
+      });
+      ctx.ui.notify(
+        [
+          `Implementation ${res.timedOut ? "TIMED OUT" : res.exitCode === 0 ? "complete" : `exited ${res.exitCode}`} ` +
+            `($${res.usage.cost.toFixed(4)}, ${res.usage.turns} turns).`,
+          res.resultText ? `\n${res.resultText}` : "",
+          "",
+          "Review with `git diff`; keep it or `git checkout .` to discard.",
+        ].join("\n"),
+        res.exitCode === 0 && !res.timedOut ? "info" : "error",
+      );
+    } catch (err) {
+      ctx.ui.notify(`Implement failed: ${(err as Error).message}`, "error");
+    }
+  }
+
+  // Run the 3 planners + judge, show the plans + verdict, then POP UP a picker so the
+  // user chooses an approach — and implement it. No slash commands required.
+  async function runPlanThenPick(task: string, ctx: any) {
+    ctx.ui.notify(`Planning 3 approaches for: ${task}`, "info");
     const record = await dispatchPlan({
       task,
       repoRoot: ctx.cwd,
@@ -58,8 +103,8 @@ export default function (pi: ExtensionAPI) {
     });
     lastPlanRun = record;
 
-    // Each agent's full plan, with a header.
-    for (const a of record.agents) {
+    // Show each agent's full plan + the judge verdict so the choice is informed.
+    for (const a of record.agents)
       ctx.ui.notify(
         [
           `=== PLAN: ${a.id} (${a.status === "ok" ? "✓" : "✗ failed"}) — ` +
@@ -68,20 +113,40 @@ export default function (pi: ExtensionAPI) {
         ].join("\n"),
         "info",
       );
-    }
-
     ctx.ui.notify(
-      [
-        `Plan run ${record.runId} complete. Totals: $${record.totals.cost.toFixed(4)} over ${record.totals.turns} turns.`,
-        `Run dir: ${record.runDir}`,
-        "",
-        "=== JUDGE VERDICT ===",
-        record.judge.verdictMarkdown || "(judge produced no text output)",
-        "",
-        `Pick one to implement on main: /dispatch-pick <id>  (available: ${record.agents.map((a) => a.id).join(", ")})`,
-      ].join("\n"),
+      ["=== JUDGE VERDICT ===", record.judge.verdictMarkdown || "(no verdict text)"].join("\n"),
       "info",
     );
+
+    const ok = record.agents.filter((a) => a.status === "ok" && a.plan.trim());
+    if (ok.length === 0)
+      return ctx.ui.notify("No usable plans were produced. Re-type your task to try again.", "error");
+
+    // Order the recommended plan first; build picker labels (id + ⭐ + approach hint).
+    const rec = record.judge.verdictJson?.recommendation ?? null;
+    const ordered = [...ok].sort((a, b) => (a.id === rec ? -1 : b.id === rec ? 1 : 0));
+    const SKIP = "✗  Skip — don't implement now";
+    const labels = ordered.map((a) => {
+      const snip = approachSnippet(a.plan);
+      return `${a.id}${a.id === rec ? "  ⭐ recommended" : ""}${snip ? `  —  ${snip}` : ""}`;
+    });
+    labels.push(SKIP);
+
+    // Non-interactive (e.g. json/print mode): no popup possible — fall back to a hint.
+    if (!ctx.hasUI)
+      return ctx.ui.notify(
+        `Pick one to implement: /dispatch-pick <id>  (available: ${ok.map((a) => a.id).join(", ")})`,
+        "info",
+      );
+
+    const choice = await ctx.ui.select("Which approach should I implement on main?", labels);
+    const idx = choice ? labels.indexOf(choice) : -1;
+    if (idx < 0 || idx >= ordered.length)
+      return ctx.ui.notify(
+        "No approach implemented. Re-type your task to refine, or /dispatch-pick <id> later.",
+        "info",
+      );
+    await implementChosen(record, ordered[idx].id, ctx);
   }
 
   // ── DEFAULT: freeform prompt → 3-agent PLAN dispatch ─────────────────────────
@@ -97,7 +162,7 @@ export default function (pi: ExtensionAPI) {
     if (text.startsWith("/")) return { action: "continue" };
 
     try {
-      await runPlanDispatch(text, ctx);
+      await runPlanThenPick(text, ctx);
     } catch (err) {
       ctx.ui.notify(
         `Dispatch failed: ${(err as Error).message}\n` +
@@ -152,16 +217,16 @@ export default function (pi: ExtensionAPI) {
           "info",
         );
       try {
-        await runPlanDispatch(task, ctx);
+        await runPlanThenPick(task, ctx);
       } catch (err) {
         ctx.ui.notify(`Dispatch failed: ${(err as Error).message}`, "error");
       }
     },
   });
 
-  // ── PICK & IMPLEMENT a plan on main ───────────────────────────────────────────
+  // ── PICK & IMPLEMENT a plan on main (manual fallback; the popup is the main path) ──
   pi.registerCommand("dispatch-pick", {
-    description: "Implement a proposed plan on main (e.g. /dispatch-pick engineer)",
+    description: "Implement a proposed plan on main (fallback; normally you use the popup)",
     handler: async (args: string, ctx: any) => {
       const id = (args ?? "").trim();
       if (!lastPlanRun) return ctx.ui.notify("Run a task first to get plans.", "error");
@@ -170,41 +235,7 @@ export default function (pi: ExtensionAPI) {
           `Usage: /dispatch-pick <id>\nAvailable: ${lastPlanRun.agents.map((a) => a.id).join(", ")}`,
           "info",
         );
-
-      const agent = lastPlanRun.agents.find((a) => a.id === id);
-      if (!agent)
-        return ctx.ui.notify(
-          `Unknown plan "${id}". Available: ${lastPlanRun.agents.map((a) => a.id).join(", ")}`,
-          "error",
-        );
-      if (agent.status !== "ok" || !agent.plan.trim())
-        return ctx.ui.notify(`Plan "${id}" failed or is empty — pick another.`, "error");
-
-      try {
-        ctx.ui.notify(`Implementing the '${id}' plan on main…`, "info");
-        const res = await implementPlan({
-          repoRoot: ctx.cwd,
-          personasDir: HERE,
-          agentId: id,
-          plan: agent.plan,
-          task: lastPlanRun.task,
-          onEvent: (e) =>
-            ctx.ui.notify(`[${e.phase}${e.agentId ? `:${e.agentId}` : ""}] ${e.message}`, "info"),
-        });
-
-        ctx.ui.notify(
-          [
-            `Implementation ${res.timedOut ? "TIMED OUT" : res.exitCode === 0 ? "complete" : `exited ${res.exitCode}`} ` +
-              `($${res.usage.cost.toFixed(4)}, ${res.usage.turns} turns).`,
-            res.resultText ? `\n${res.resultText}` : "",
-            "",
-            "Review with `git diff`; keep it or `git checkout .` to discard.",
-          ].join("\n"),
-          res.exitCode === 0 && !res.timedOut ? "info" : "error",
-        );
-      } catch (err) {
-        ctx.ui.notify(`Implement failed: ${(err as Error).message}`, "error");
-      }
+      await implementChosen(lastPlanRun, id, ctx);
     },
   });
 
