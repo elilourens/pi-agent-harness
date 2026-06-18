@@ -13,6 +13,20 @@ Multi-model coding agent powered by [Pi](https://pi.dev) with automatic tool-bas
 
 The router doesn't guess from keywords — it watches which tools the LLM reaches for and swaps to the right model automatically.
 
+## Dispatch / Judge (multi-strategy agents)
+
+`/dispatch <task>` runs the **same task** through three competing Claude Code agents — **Hustler** (laziest viable path), **Engineer** (by the book), **Native** (baseline) — each in its own isolated git worktree, then a **judge** independently re-runs their tests and scores them on a 7-criteria rubric.
+
+The implementers and judge run as headless **Claude Code** processes under your **subscription** (no metered API credits — keep `ANTHROPIC_API_KEY` unset and `claude` logged in). Pi itself makes no LLM calls for this; it's pure orchestration.
+
+```
+/dispatch <task>            fan out 3 strategies → judge verdict + recommendation
+/dispatch-promote <id>      merge a winner (agent/hustler|engineer|native) into main
+/dispatch-synthesize        build a hybrid of the three on agent/synthesis
+```
+
+See **[docs/dispatch.md](docs/dispatch.md)** for how to invoke, tune the personas, and change the rubric weights, and **[examples/sample-task/](examples/sample-task/)** for a tiny end-to-end demo task.
+
 ## Quick Setup
 
 ```bash

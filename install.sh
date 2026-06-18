@@ -12,7 +12,15 @@ echo "Pi version: $(pi --version)"
 mkdir -p "$AGENT/extensions"
 cp "$DIR/config/settings.json" "$AGENT/settings.json"
 cp "$DIR/config/extensions/model-router.ts" "$AGENT/extensions/model-router.ts"
-echo "✓ config installed"
+# Dispatch/judge extension (multi-file dir incl. personas + rubric).
+rm -rf "$AGENT/extensions/dispatch"
+cp -R "$DIR/config/extensions/dispatch" "$AGENT/extensions/dispatch"
+echo "✓ config installed (model-router + dispatch)"
+
+# Dispatch requires the Claude Code CLI (runs implementers under your subscription).
+command -v claude &>/dev/null \
+  && echo "✓ claude CLI: $(claude --version 2>/dev/null || echo present)" \
+  || echo "⚠ 'claude' CLI not found — /dispatch needs it (install: https://claude.com/code). API key NOT required; uses your subscription."
 
 # API key → auth.json (keep existing; else env var; else prompt)
 if [ ! -f "$AGENT/auth.json" ]; then
@@ -52,4 +60,6 @@ EOF
   echo "✓ systemd service enabled (start: sudo systemctl start pi-agent)"
 fi
 
-echo "Done. Run 'pi' to start. Commands: /plan /code /search /opus /router-status"
+echo "Done. Run 'pi' to start."
+echo "  Routing:  /plan /code /search /opus /router-status /cost"
+echo "  Dispatch: /dispatch <task>  •  /dispatch-promote <id>  •  /dispatch-synthesize"

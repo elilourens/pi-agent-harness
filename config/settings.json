@@ -22,7 +22,8 @@
     "claude-haiku-4-5"
   ],
   "extensions": [
-    "~/.pi/agent/extensions/model-router.ts"
+    "~/.pi/agent/extensions/model-router.ts",
+    "~/.pi/agent/extensions/dispatch/index.ts"
   ],
   "warnings": {
     "anthropicExtraUsage": false

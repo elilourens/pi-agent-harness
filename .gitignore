@@ -8,3 +8,6 @@ Thumbs.db
 
 # Node
 node_modules/
+
+# Dispatch harness run artifacts (worktrees, transcripts, verdicts)
+.pi-dispatch/
